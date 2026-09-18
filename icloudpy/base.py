@@ -138,6 +138,16 @@ class ICloudPySession(Session):
         request_logger.debug(data)
 
         if isinstance(data, dict):
+            # Surface Apple's structured service errors (e.g. "Incorrect Verification Code")
+            service_errors = data.get("serviceErrors")
+            if not response.ok and isinstance(service_errors, list) and service_errors:
+                error = service_errors[0]
+                if isinstance(error, dict):
+                    self._raise_error(
+                        error.get("code") or response.status_code,
+                        error.get("message") or response.reason,
+                    )
+
             reason = data.get("errorMessage")
             reason = reason or data.get("reason")
             reason = reason or data.get("errorReason")
@@ -173,12 +183,21 @@ class ICloudPySession(Session):
             reason = "Authentication required for Account."
 
         api_error = ICloudPyAPIResponseException(reason, code)
-        LOGGER.error(api_error)
+        # 421 is handled by retry logic, log as DEBUG to avoid misleading errors
+        if code == 421:
+            LOGGER.debug(api_error)
+        else:
+            LOGGER.error(api_error)
         raise api_error
 
     # Public method to resolve linting error
     def raise_error(self, code, reason):
         return self._raise_error(code=code, reason=reason)
+
+    def save_session_data(self):
+        with open(self.service.session_path, "w", encoding="utf-8") as outfile:
+            json.dump(self.service.session_data, outfile)
+            LOGGER.debug("Saved session data to file")
 
 
 class ICloudPyService:
@@ -284,7 +303,17 @@ class ICloudPyService:
                 self.data = self._validate_token()
                 login_successful = True
             except ICloudPyAPIResponseException:
-                LOGGER.debug("Invalid authentication token, will log in from scratch.")
+                LOGGER.debug("Invalid authentication token, trying direct accountLogin before SRP.")
+                try:
+                    self._authenticate_with_token()
+                    login_successful = True
+                    LOGGER.debug("Re-authenticated with stored token (skipped SRP).")
+                except (ICloudPyAPIResponseException, ICloudPyFailedLoginException):
+                    LOGGER.debug("Direct accountLogin also failed, will log in from scratch.")
+                    if "setup_endpoint" in self.session_data:
+                        LOGGER.debug("Clearing stale setup_endpoint before SRP fallback.")
+                        del self.session_data["setup_endpoint"]
+                        self.session.save_session_data()
 
         if not login_successful and service is not None:
             app = self.data["apps"][service]
@@ -402,8 +431,34 @@ class ICloudPyService:
                     headers=headers,
                 )
             except ICloudPyAPIResponseException as error:
-                msg = "Invalid email/password combination."
-                raise ICloudPyFailedLoginException(msg, error) from error
+                if str(error.code) == "429" or str(error.code) in {str(c) for c in range(500, 600)}:
+                    raise
+                # Credentials explicitly rejected — no point retrying with direct login
+                if str(error.code) in ("403", "401", "409"):
+                    msg = "Invalid email/password combination."
+                    raise ICloudPyFailedLoginException(msg, error) from error
+                # SRP protocol failure (e.g. app-specific password) - fallback to direct login
+                LOGGER.debug("SRP failed (%s), trying direct password login.", error.code)
+                login_data = {
+                    "accountName": self.user["accountName"],
+                    "password": self.user["password"],
+                    "rememberMe": True,
+                    "trustTokens": [],
+                }
+                if self.session_data.get("trust_token"):
+                    login_data["trustTokens"] = [self.session_data.get("trust_token")]
+                try:
+                    self.session.post(
+                        f"{self.auth_endpoint}/signin",
+                        params={"isRememberMeEnabled": "true"},
+                        data=json.dumps(login_data),
+                        headers=headers,
+                    )
+                except ICloudPyAPIResponseException as error2:
+                    if str(error2.code) == "429" or str(error2.code) in {str(code) for code in range(500, 600)}:
+                        raise
+                    msg = "Invalid email/password combination."
+                    raise ICloudPyFailedLoginException(msg, error2) from error2
 
             self._authenticate_with_token()
 
@@ -413,13 +468,20 @@ class ICloudPyService:
 
     def _authenticate_with_token(self):
         """Authenticate using session token."""
+        if not self.session_data.get("session_token"):
+            raise ICloudPyFailedLoginException(
+                "Apple did not return a session token. Authentication could not be completed."
+            )
         data = {
             "accountCountryCode": self.session_data.get("account_country"),
             "dsWebAuthToken": self.session_data.get("session_token"),
             "extended_login": True,
             "trustToken": self.session_data.get("trust_token", ""),
         }
-
+        # Always use the generic setup endpoint — partition-specific endpoints
+        # (e.g. p151-setup.icloud.com) become stale and cause 421 loops.
+        # Clear any stale partition endpoint that may have been persisted.
+        self.session_data.pop("setup_endpoint", None)
         try:
             req = self.session.post(
                 f"{self.setup_endpoint}/accountLogin",
@@ -438,9 +500,19 @@ class ICloudPyService:
             "password": self.user["password"],
         }
 
+        # Service-specific logins (e.g. "find") need the partition-specific
+        # endpoint; the generic setup.icloud.com returns 421 for these.
+        endpoint = self.setup_endpoint
+        try:
+            account_url = self._webservices["account"]["url"]
+            if account_url:
+                endpoint = account_url.rstrip("/") + "/setup/ws/1"
+        except Exception:
+            pass
+
         try:
             self.session.post(
-                f"{self.setup_endpoint}/accountLogin",
+                f"{endpoint}/accountLogin",
                 data=json.dumps(data),
             )
 
@@ -452,11 +524,23 @@ class ICloudPyService:
     def _validate_token(self):
         """Checks if the current access token is still valid."""
         LOGGER.debug("Checking session token validity")
+        # Always use the generic setup endpoint to avoid stale-partition 421 loops.
         try:
             req = self.session.post(f"{self.setup_endpoint}/validate", data="null")
             LOGGER.debug("Session token is still valid")
             return req.json()
         except ICloudPyAPIResponseException as err:
+            # Transient server errors should not trigger a full SRP re-login
+            if err.code in (500, 502, 503, 504):
+                LOGGER.debug("Transient error during token validation (%s), retrying once", err.code)
+                import time
+                time.sleep(2)
+                try:
+                    req = self.session.post(f"{self.setup_endpoint}/validate", data="null")
+                    LOGGER.debug("Session token is still valid (after retry)")
+                    return req.json()
+                except ICloudPyAPIResponseException:
+                    pass
             LOGGER.debug("Invalid authentication token")
             raise err
 
@@ -543,7 +627,7 @@ class ICloudPyService:
                 data=data,
             )
         except ICloudPyAPIResponseException as error:
-            if error.code == -21669:
+            if str(error.code) == "-21669":
                 # Wrong verification code
                 return False
             raise
@@ -613,7 +697,7 @@ class ICloudPyService:
                 headers=headers,
             )
         except ICloudPyAPIResponseException as error:
-            if error.code == -21669:
+            if str(error.code) == "-21669":
                 # Wrong verification code
                 LOGGER.error("Code verification failed.")
                 return False
