@@ -343,9 +343,25 @@ class ICloudPyService:
                         del self.session_data["setup_endpoint"]
                         self.session.save_session_data()
 
+        # On force_refresh (e.g. FMIP 450), try token auth on the generic
+        # endpoint first — avoids credentials+appName on the partition
+        # endpoint which returns 421.
+        if not login_successful and force_refresh and self.session_data.get("session_token"):
+            LOGGER.debug("Force-refresh: re-authenticating with stored token")
+            try:
+                self._authenticate_with_token()
+                login_successful = True
+                LOGGER.debug("Re-authenticated with stored token (force-refresh).")
+            except ICloudPyAPIResponseException as err:
+                if self._is_transient_error(err):
+                    raise
+                LOGGER.debug("Token re-auth failed on force-refresh: %s", str(err))
+            except ICloudPyFailedLoginException as err:
+                LOGGER.debug("Token re-auth failed on force-refresh: %s", str(err))
+
         if not login_successful and service is not None:
-            app = self.data["apps"][service]
-            if "canLaunchWithOneFactor" in app and app["canLaunchWithOneFactor"] is True:
+            app = self.data.get("apps", {}).get(service, {})
+            if app.get("canLaunchWithOneFactor") is True:
                 LOGGER.debug(
                     "Authenticating as %s for %s",
                     self.user["accountName"],
