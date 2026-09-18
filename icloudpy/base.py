@@ -10,6 +10,7 @@ import logging
 from os import mkdir, path
 from re import match
 from tempfile import gettempdir
+import time
 from uuid import uuid1
 
 import srp
@@ -98,7 +99,7 @@ class ICloudPySession(Session):
         self.cookies.save(ignore_discard=True, ignore_expires=True)
         LOGGER.debug("Cookies saved to %s", self.service.cookiejar_path)
 
-        if not response.ok and (content_type not in json_mimetypes or response.status_code in [421, 450, 500]):
+        if not response.ok and (content_type not in json_mimetypes or response.status_code in [421, 450] or response.status_code >= 500):
             try:
                 # pylint: disable=W0212
                 fmip_url = self.service._get_webservice_url("findme")
@@ -114,13 +115,21 @@ class ICloudPySession(Session):
             except Exception:
                 pass
 
-            if has_retried is None and response.status_code in [421, 450, 500]:
+            if has_retried is None and response.status_code in [421, 450]:
                 api_error = ICloudPyAPIResponseException(
                     response.reason,
                     response.status_code,
                     retry=True,
                 )
                 request_logger.debug(api_error)
+                kwargs["retried"] = True
+                return self.request(method, url, **kwargs)
+            # 5xx: transient server error — retry once without re-authentication
+            if has_retried is None and response.status_code >= 500:
+                request_logger.debug(
+                    "Transient server error (%s), retrying once", response.status_code
+                )
+                time.sleep(2)
                 kwargs["retried"] = True
                 return self.request(method, url, **kwargs)
 
@@ -179,7 +188,7 @@ class ICloudPySession(Session):
                 reason + ".  Please wait a few minutes then try again."
                 "The remote servers might be trying to throttle requests."
             )
-        if code in [421, 450, 500]:
+        if code in [421, 450]:
             reason = "Authentication required for Account."
 
         api_error = ICloudPyAPIResponseException(reason, code)
@@ -290,6 +299,15 @@ class ICloudPyService:
         self._drive = None
         self._photos = None
 
+    @staticmethod
+    def _is_transient_error(err):
+        """Return True if the error is a transient server error (5xx)."""
+        code = getattr(err, 'code', None)
+        try:
+            return int(code) >= 500
+        except (TypeError, ValueError):
+            return False
+
     def authenticate(self, force_refresh=False, service=None):
         """
         Handles authentication, and persists cookies so that
@@ -302,13 +320,23 @@ class ICloudPyService:
             try:
                 self.data = self._validate_token()
                 login_successful = True
-            except ICloudPyAPIResponseException:
+            except ICloudPyAPIResponseException as err:
+                if self._is_transient_error(err):
+                    raise
                 LOGGER.debug("Invalid authentication token, trying direct accountLogin before SRP.")
                 try:
                     self._authenticate_with_token()
                     login_successful = True
                     LOGGER.debug("Re-authenticated with stored token (skipped SRP).")
-                except (ICloudPyAPIResponseException, ICloudPyFailedLoginException):
+                except ICloudPyAPIResponseException as err2:
+                    if self._is_transient_error(err2):
+                        raise
+                    LOGGER.debug("Direct accountLogin also failed, will log in from scratch.")
+                    if "setup_endpoint" in self.session_data:
+                        LOGGER.debug("Clearing stale setup_endpoint before SRP fallback.")
+                        del self.session_data["setup_endpoint"]
+                        self.session.save_session_data()
+                except ICloudPyFailedLoginException:
                     LOGGER.debug("Direct accountLogin also failed, will log in from scratch.")
                     if "setup_endpoint" in self.session_data:
                         LOGGER.debug("Clearing stale setup_endpoint before SRP fallback.")
@@ -327,6 +355,13 @@ class ICloudPyService:
                 try:
                     self._authenticate_with_credentials_service(service)
                     login_successful = True
+                except ICloudPyAPIResponseException as error:
+                    if self._is_transient_error(error):
+                        raise
+                    LOGGER.debug(
+                        "Could not log into service. Attempting brand new login. %s",
+                        str(error),
+                    )
                 except Exception as error:
                     LOGGER.debug(
                         "Could not log into service. Attempting brand new login. %s",
@@ -434,7 +469,7 @@ class ICloudPyService:
                 if str(error.code) == "429" or str(error.code) in {str(c) for c in range(500, 600)}:
                     raise
                 # Credentials explicitly rejected — no point retrying with direct login
-                if str(error.code) in ("403", "401", "409"):
+                if str(error.code) in ("403", "401", "409", "-20101"):
                     msg = "Invalid email/password combination."
                     raise ICloudPyFailedLoginException(msg, error) from error
                 # SRP protocol failure (e.g. app-specific password) - fallback to direct login
@@ -489,6 +524,8 @@ class ICloudPyService:
             )
             self.data = req.json()
         except ICloudPyAPIResponseException as error:
+            if self._is_transient_error(error):
+                raise  # 5xx: preserve session, let caller handle
             msg = "Invalid authentication token."
             raise ICloudPyFailedLoginException(msg, error) from error
 
@@ -518,6 +555,8 @@ class ICloudPyService:
 
             self.data = self._validate_token()
         except ICloudPyAPIResponseException as error:
+            if self._is_transient_error(error):
+                raise  # 5xx: preserve session, let caller handle
             msg = "Invalid email/password combination."
             raise ICloudPyFailedLoginException(msg, error) from error
 
@@ -525,24 +564,14 @@ class ICloudPyService:
         """Checks if the current access token is still valid."""
         LOGGER.debug("Checking session token validity")
         # Always use the generic setup endpoint to avoid stale-partition 421 loops.
+        # Retries are handled by request() — no duplicate retry here.
         try:
             req = self.session.post(f"{self.setup_endpoint}/validate", data="null")
             LOGGER.debug("Session token is still valid")
             return req.json()
         except ICloudPyAPIResponseException as err:
-            # Transient server errors should not trigger a full SRP re-login
-            if err.code in (500, 502, 503, 504):
-                LOGGER.debug("Transient error during token validation (%s), retrying once", err.code)
-                import time
-                time.sleep(2)
-                try:
-                    req = self.session.post(f"{self.setup_endpoint}/validate", data="null")
-                    LOGGER.debug("Session token is still valid (after retry)")
-                    return req.json()
-                except ICloudPyAPIResponseException:
-                    pass
-            LOGGER.debug("Invalid authentication token")
-            raise err
+            LOGGER.debug("Token validation failed (%s)", err.code)
+            raise
 
     def _get_auth_headers(self, overrides=None):
         headers = {
